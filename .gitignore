@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Kokoro model files (~340 MB) — downloaded by setup.sh
+daemon/models/*.onnx
+daemon/models/*.bin
+
+# Runtime data
+*.wav
+*.mp3
+*.meta.json
+*.icloud
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/
