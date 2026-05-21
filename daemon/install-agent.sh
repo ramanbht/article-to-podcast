@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # Install and load the LaunchAgent so the daemon runs at login.
 #
-# Required env (or use --public-url ...):
-#   PODCAST_PUBLIC_URL  full URL the iPhone hits (e.g. http://my-mac.tailnet-xxx.ts.net:8765)
-#
-# Optional env:
+# Optional env (bake-in to plist):
+#   PODCAST_PUBLIC_URL    full URL where MP3s/feed live. When B2 is enabled,
+#                         use the B2 download URL pattern; otherwise the local
+#                         hostname for LAN-only use.
 #   PODCAST_HTTP_PORT     default 8765
 #   PODCAST_INBOX         default: iCloud Drive/Podcast/inbox
 #   PODCAST_DATA_DIR      default: ~/Library/Application Support/PodcastDaemon
-#   PODCAST_FEED_TITLE, PODCAST_FEED_DESCRIPTION, PODCAST_FEED_AUTHOR, PODCAST_VOICE
+#   PODCAST_VAULT_DIR     default: <DATA_DIR>/vault
+#   PODCAST_VOICE         Kokoro voice id (default af_heart)
+#   PODCAST_SCRIPT_MODEL  default claude-opus-4-7
+#   PODCAST_GROUPING_MODEL  default claude-haiku-4-5-20251001
+#   PODCAST_FEED_TITLE, PODCAST_FEED_DESCRIPTION, PODCAST_FEED_AUTHOR
+#
+# Backblaze B2 (set all three to enable cloud upload + Apple-Podcasts-compat):
+#   PODCAST_B2_KEY_ID, PODCAST_B2_APP_KEY, PODCAST_B2_BUCKET
+#   PODCAST_B2_PREFIX   optional path prefix inside bucket
 set -euo pipefail
 
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,7 +51,10 @@ mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
 # Build the EnvironmentVariables block from any PODCAST_* env we have.
 ENV_KV=""
 for v in PODCAST_PUBLIC_URL PODCAST_HTTP_PORT PODCAST_INBOX PODCAST_DATA_DIR \
-         PODCAST_FEED_TITLE PODCAST_FEED_DESCRIPTION PODCAST_FEED_AUTHOR PODCAST_VOICE; do
+         PODCAST_VAULT_DIR PODCAST_FEED_TITLE PODCAST_FEED_DESCRIPTION \
+         PODCAST_FEED_AUTHOR PODCAST_VOICE PODCAST_SCRIPT_MODEL \
+         PODCAST_GROUPING_MODEL PODCAST_B2_KEY_ID PODCAST_B2_APP_KEY \
+         PODCAST_B2_BUCKET PODCAST_B2_PREFIX; do
   val="${!v:-}"
   if [ -n "$val" ]; then
     # XML-escape & < > " for the plist

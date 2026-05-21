@@ -21,6 +21,23 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import config
+import upload
+
+
+def _episode_public_url(mp3_name: str) -> str:
+    """Where the iPhone fetches the MP3 from.
+
+    With B2 enabled, point at the B2 public URL (HTTPS, reachable anywhere).
+    Otherwise fall back to the local HTTP server.
+    """
+    if config.b2_enabled():
+        try:
+            return upload.public_url_for(f"episodes/{mp3_name}")
+        except Exception:
+            # If B2 lookup fails (offline, creds wrong), fall back so the local
+            # / index still works.
+            pass
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/episodes/{mp3_name}"
 
 
 def _load_meta() -> list[dict]:
@@ -47,7 +64,7 @@ def _iso_to_rfc2822(iso: str | None) -> str:
         return format_datetime(datetime.now(timezone.utc))
 
 
-def _build_feed() -> bytes:
+def build_feed() -> bytes:
     base = config.PUBLIC_BASE_URL.rstrip("/")
     chan_title = html.escape(config.FEED_TITLE)
     chan_desc = html.escape(config.FEED_DESCRIPTION)
@@ -70,7 +87,7 @@ def _build_feed() -> bytes:
         pub = _iso_to_rfc2822(m.get("doneAt") or m.get("createdAt"))
         duration = int(round(float(m.get("durationSec") or 0)))
         length = mp3_path.stat().st_size
-        enclosure_url = f"{base}/episodes/{mp3_name}"
+        enclosure_url = _episode_public_url(mp3_name)
 
         items_xml.append(f"""    <item>
       <title>{title}</title>
@@ -234,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self._send(200, _build_index(), "text/html; charset=utf-8")
         if path == "/feed.xml":
-            return self._send(200, _build_feed(), "application/rss+xml; charset=utf-8")
+            return self._send(200, build_feed(), "application/rss+xml; charset=utf-8")
         if path.startswith("/episodes/"):
             name = path[len("/episodes/"):]
             if not _SAFE_NAME.match(name):

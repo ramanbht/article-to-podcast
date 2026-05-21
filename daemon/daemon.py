@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Podcast daemon: watches an iCloud Drive inbox for `request-*.json` files,
-turns each URL into an episode, exposes them as a private podcast RSS feed.
+"""Podcast daemon: watches an iCloud Drive inbox for request files, batches
+them, groups related ones, generates memory-aware scripts, synthesizes audio,
+optionally uploads to Backblaze B2, and maintains a markdown knowledge vault.
 
-Inbox layout (iCloud Drive, writable by an iPhone Shortcut):
-  ~/Library/Mobile Documents/com~apple~CloudDocs/Podcast/inbox/
-    request-{id}.json   { "id": "...", "url": "..." }
-
-Episode layout (local, served via HTTP):
-  ~/Library/Application Support/PodcastDaemon/episodes/
-    {id}.mp3            audio
-    {id}.txt            script
-    {id}.meta.json      { id, url, title, durationSec, createdAt, doneAt }
+Per-iteration flow:
+  1. Find all stable request files in the inbox.
+  2. Fetch each article's body.
+  3. Load vault and build the memory context.
+  4. Ask Claude to group articles that should be combined.
+  5. For each group, generate script + metadata, synthesize, encode to MP3.
+  6. Save a vault note. If B2 is enabled, upload MP3 + new feed.xml.
 """
 from __future__ import annotations
 
@@ -19,19 +18,28 @@ import subprocess
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import combine
 import config
+import upload
+import vault
 from extract import fetch_article
 from generate_script import generate_script
+from memory import build_context, suggest_related_slugs
+from server import build_feed, run_server
 from synthesize import synthesize
-from server import run_server
 
 POLL_SECONDS = 5
 STABLE_CHECKS = 2  # number of polls a file must be stable before we process it
 ERROR_LOG = config.DATA_DIR / "errors.log"
 
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -48,15 +56,16 @@ def log_error(msg: str) -> None:
         f.write(f"[{now_iso()}] {msg}\n")
 
 
+# ---------------------------------------------------------------------------
+# iCloud placeholder handling
+# ---------------------------------------------------------------------------
+
 def is_icloud_placeholder(path: Path) -> bool:
-    """iCloud shows undownloaded files as `.<name>.icloud`."""
     return path.name.startswith(".") and path.name.endswith(".icloud")
 
 
 def materialize_placeholder(placeholder: Path) -> Path | None:
-    """Trigger iCloud download of a placeholder. Returns the real path once
-    materialized (waits up to 30s), or None on timeout."""
-    real_name = placeholder.name[1:].removesuffix(".icloud")  # ".x.json.icloud" -> "x.json"
+    real_name = placeholder.name[1:].removesuffix(".icloud")
     real_path = placeholder.parent / real_name
     if real_path.exists():
         return real_path
@@ -75,7 +84,6 @@ def materialize_placeholder(placeholder: Path) -> Path | None:
 
 
 def find_request_files(inbox: Path) -> list[Path]:
-    """Return all materialized request-*.json files, pulling iCloud placeholders down first."""
     materialized: list[Path] = []
     for p in inbox.iterdir():
         if is_icloud_placeholder(p):
@@ -90,8 +98,11 @@ def find_request_files(inbox: Path) -> list[Path]:
     return sorted(materialized)
 
 
+# ---------------------------------------------------------------------------
+# Meta JSON helpers (per-episode, in EPISODES_DIR)
+# ---------------------------------------------------------------------------
+
 def write_meta(meta_path: Path, **fields) -> None:
-    """Atomic meta JSON write."""
     existing: dict = {}
     if meta_path.exists():
         try:
@@ -104,8 +115,11 @@ def write_meta(meta_path: Path, **fields) -> None:
     tmp.replace(meta_path)
 
 
+# ---------------------------------------------------------------------------
+# WAV → MP3
+# ---------------------------------------------------------------------------
+
 def wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
-    """Encode WAV → MP3 (mono, 64k) via ffmpeg. ~5x smaller, fine for voice."""
     subprocess.run(
         [
             "ffmpeg", "-y", "-loglevel", "error",
@@ -117,50 +131,117 @@ def wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
     )
 
 
-def process_request(request_path: Path) -> None:
-    raw = request_path.read_text()
+# ---------------------------------------------------------------------------
+# B2 upload (optional)
+# ---------------------------------------------------------------------------
+
+def upload_episode_and_feed(mp3_path: Path) -> None:
+    """Upload MP3 then regenerate-and-upload feed.xml."""
+    if not config.b2_enabled():
+        return
     try:
-        payload = json.loads(raw)
+        upload.upload_file(mp3_path, f"episodes/{mp3_path.name}", content_type="audio/mpeg")
+        log(f"   ↑ B2: episodes/{mp3_path.name}")
+        feed_bytes = build_feed()
+        # Write feed locally too so the / index reflects it.
+        local_feed = config.DATA_DIR / "feed.xml"
+        local_feed.write_bytes(feed_bytes)
+        # Upload feed last so subscribers never see a feed referencing a missing MP3.
+        upload.upload_file(local_feed, "feed.xml", content_type="application/rss+xml")
+        log(f"   ↑ B2: feed.xml")
     except Exception as e:
-        log_error(f"bad JSON in {request_path.name}: {e}")
-        request_path.unlink(missing_ok=True)
-        return
+        log_error(f"B2 upload failed: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Request → episode
+# ---------------------------------------------------------------------------
+
+def _parse_request(req_path: Path) -> dict | None:
+    try:
+        payload = json.loads(req_path.read_text())
+    except Exception as e:
+        log_error(f"bad JSON in {req_path.name}: {e}")
+        return None
     url = (payload.get("url") or "").strip()
-    req_id = (payload.get("id") or request_path.stem.removeprefix("request-")).strip()
-    if not url or not req_id:
-        log_error(f"missing url or id in {request_path.name}: {payload!r}")
-        request_path.unlink(missing_ok=True)
-        return
+    rid = (payload.get("id") or req_path.stem.removeprefix("request-")).strip()
+    if not url or not rid:
+        log_error(f"missing url or id in {req_path.name}: {payload!r}")
+        return None
+    return {
+        "id": rid,
+        "url": url,
+        "createdAt": payload.get("createdAt") or now_iso(),
+        "_path": req_path,
+    }
 
-    log(f"→ {req_id}: {url}")
 
-    meta_path = config.EPISODES_DIR / f"{req_id}.meta.json"
-    script_path = config.EPISODES_DIR / f"{req_id}.txt"
-    wav_path = config.EPISODES_DIR / f"{req_id}.wav"
-    mp3_path = config.EPISODES_DIR / f"{req_id}.mp3"
-    created_at = payload.get("createdAt") or now_iso()
+def _fetch_with_status(article: dict) -> dict | None:
+    """Fetch the article body, writing a per-request meta while we work."""
+    meta_path = config.EPISODES_DIR / f"{article['id']}.meta.json"
     write_meta(
         meta_path,
-        id=req_id, url=url, title=None,
-        status="fetching", createdAt=created_at,
+        id=article["id"],
+        url=article["url"],
+        title=None,
+        status="fetching",
+        createdAt=article["createdAt"],
+    )
+    try:
+        title, body = fetch_article(article["url"])
+    except Exception as e:
+        log_error(f"✗ fetch failed for {article['id']} ({article['url']}): {e}")
+        write_meta(meta_path, status="error", error=f"fetch: {e}", errorAt=now_iso())
+        article["_path"].unlink(missing_ok=True)
+        return None
+    article["title"] = title
+    article["body"] = body
+    write_meta(meta_path, title=title, status="queued")
+    log(f"   fetched: {title!r} ({len(body)} chars) [{article['id']}]")
+    return article
+
+
+def _episode_id(group: list[dict]) -> str:
+    """Pick a stable id for the episode produced from a group."""
+    if len(group) == 1:
+        return group[0]["id"]
+    # Use first id as the canonical episode id; combined episodes mark "combined_with".
+    return group[0]["id"]
+
+
+def process_group(group: list[dict], memory_context: str, vault_notes: list[vault.Note]) -> None:
+    ep_id = _episode_id(group)
+    title_for_log = group[0]["title"] if len(group) == 1 else f"{len(group)} combined articles starting with {group[0]['title']!r}"
+    log(f"→ episode {ep_id}: {title_for_log}")
+
+    meta_path = config.EPISODES_DIR / f"{ep_id}.meta.json"
+    script_path = config.EPISODES_DIR / f"{ep_id}.txt"
+    wav_path = config.EPISODES_DIR / f"{ep_id}.wav"
+    mp3_path = config.EPISODES_DIR / f"{ep_id}.mp3"
+
+    combined_ids = [a["id"] for a in group]
+    write_meta(
+        meta_path,
+        id=ep_id, url=group[0]["url"],
+        title=group[0]["title"],
+        status="scripting",
+        combinedIds=combined_ids if len(group) > 1 else None,
     )
 
     try:
-        title, body = fetch_article(url)
-        log(f"   fetched: {title!r} ({len(body)} chars)")
-        write_meta(meta_path, title=title, status="scripting")
+        script_result = generate_script(
+            [{"url": a["url"], "title": a["title"], "body": a["body"]} for a in group],
+            memory_context=memory_context,
+        )
+        script_path.write_text(script_result.script)
+        log(f"   scripted: {len(script_result.script)} chars; topics={script_result.topics}")
+        write_meta(meta_path, status="synthesizing", topics=script_result.topics)
 
-        script = generate_script(url, title, body)
-        script_path.write_text(script)
-        log(f"   scripted: {len(script)} chars")
-        write_meta(meta_path, status="synthesizing")
-
-        duration = synthesize(script, wav_path)
+        duration = synthesize(script_result.script, wav_path)
         log(f"   synthesized: {duration:.1f}s WAV")
 
         wav_to_mp3(wav_path, mp3_path)
-        wav_path.unlink(missing_ok=True)  # keep only the smaller MP3
+        wav_path.unlink(missing_ok=True)
         log(f"   encoded → {mp3_path.name}")
 
         write_meta(
@@ -171,18 +252,52 @@ def process_request(request_path: Path) -> None:
             scriptFile=script_path.name,
             doneAt=now_iso(),
         )
-        log(f"✓ {req_id} done ({duration:.1f}s audio)")
+
+        # Write vault note.
+        date_str = vault.today_str()
+        episode_title = group[0]["title"] or f"episode {ep_id}"
+        if len(group) > 1:
+            episode_title = " + ".join(a["title"] for a in group)
+        slug = vault.note_slug(date_str, episode_title)
+        related = suggest_related_slugs(vault_notes, script_result.topics)
+        vault.save_note(
+            slug=slug,
+            url=group[0]["url"] if len(group) == 1 else "; ".join(a["url"] for a in group),
+            title=episode_title,
+            date=date_str,
+            duration_sec=duration,
+            episode_id=ep_id,
+            topics=script_result.topics,
+            summary=script_result.summary,
+            key_claims=script_result.key_claims,
+            related_slugs=related,
+            extra={"combined_ids": combined_ids} if len(group) > 1 else None,
+        )
+        log(f"   📝 vault: {slug}.md ({len(script_result.key_claims)} claims)")
+
+        # Upload to B2 (no-op if not configured).
+        upload_episode_and_feed(mp3_path)
+
+        log(f"✓ {ep_id} done ({duration:.1f}s audio)")
     except Exception as e:
         tb = traceback.format_exc()
-        log_error(f"✗ {req_id}: {e}\n{tb}")
+        log_error(f"✗ {ep_id}: {e}\n{tb}")
         write_meta(meta_path, status="error", error=str(e), errorAt=now_iso())
     finally:
-        request_path.unlink(missing_ok=True)
+        # Always clean up request files for the group, even on failure.
+        for a in group:
+            a["_path"].unlink(missing_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# Watch loop
+# ---------------------------------------------------------------------------
 
 def watch_loop() -> None:
     log(f"watching inbox: {config.INBOX_DIR}")
     log(f"episodes dir : {config.EPISODES_DIR}")
+    log(f"vault dir    : {config.VAULT_DIR}")
+    log(f"B2 upload    : {'enabled (' + config.B2_BUCKET + ')' if config.b2_enabled() else 'disabled'}")
 
     sizes: dict[Path, list[int]] = {}
     while True:
@@ -191,6 +306,10 @@ def watch_loop() -> None:
                 config.INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
             requests = find_request_files(config.INBOX_DIR)
+
+            # Stability check: only process files that haven't changed size for
+            # STABLE_CHECKS consecutive polls (iCloud sync still in flight).
+            stable: list[Path] = []
             for req in requests:
                 try:
                     sz = req.stat().st_size
@@ -198,19 +317,41 @@ def watch_loop() -> None:
                     continue
                 history = sizes.setdefault(req, [])
                 history.append(sz)
-                if len(history) < STABLE_CHECKS or len(set(history[-STABLE_CHECKS:])) != 1:
-                    continue
-                sizes.pop(req, None)
-                process_request(req)
+                if len(history) >= STABLE_CHECKS and len(set(history[-STABLE_CHECKS:])) == 1:
+                    stable.append(req)
+                    sizes.pop(req, None)
+
+            if stable:
+                _run_batch(stable)
         except Exception as e:
             log_error(f"loop error: {e}\n{traceback.format_exc()}")
 
         time.sleep(POLL_SECONDS)
 
 
+def _run_batch(request_paths: list[Path]) -> None:
+    # Parse + fetch all requests in this batch.
+    parsed = [p for p in (_parse_request(rp) for rp in request_paths) if p is not None]
+    fetched = [a for a in (_fetch_with_status(a) for a in parsed) if a is not None]
+    if not fetched:
+        return
+
+    vault_notes = vault.load_all_notes()
+    memory_context = build_context(vault_notes)
+    if memory_context:
+        log(f"   memory context: {sum(1 for _ in vault_notes)} vault notes loaded")
+
+    # Group related articles (no-op for single-article batches).
+    groups = combine.group_articles(fetched)
+    if len(groups) != len(fetched):
+        log(f"   combine: {len(fetched)} articles → {len(groups)} episode(s)")
+
+    for g in groups:
+        process_group(g, memory_context, vault_notes)
+
+
 def main() -> int:
     config.ensure_dirs()
-    # Run HTTP server in a daemon thread so the watcher keeps the process alive.
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
     try:

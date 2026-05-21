@@ -5,9 +5,9 @@ import os
 import socket
 from pathlib import Path
 
-# Inbox lives in plain iCloud Drive so an iPhone Shortcut can write here
-# with no special container or signing. The folder is visible in Files app
-# as "iCloud Drive → Podcast".
+# ---------------------------------------------------------------------------
+# Inbox: where iPhone Shortcuts drop request files (via iCloud Drive).
+# ---------------------------------------------------------------------------
 INBOX_DIR = Path(
     os.environ.get(
         "PODCAST_INBOX",
@@ -15,8 +15,9 @@ INBOX_DIR = Path(
     )
 ).expanduser()
 
-# Episodes + metadata are local-only. They're served over HTTP, no need to
-# round-trip through iCloud (saves space and sync churn).
+# ---------------------------------------------------------------------------
+# Local data: generated episodes + knowledge vault + state.
+# ---------------------------------------------------------------------------
 DATA_DIR = Path(
     os.environ.get(
         "PODCAST_DATA_DIR",
@@ -26,16 +27,26 @@ DATA_DIR = Path(
 
 EPISODES_DIR = DATA_DIR / "episodes"
 
-# HTTP server
+# Knowledge vault: one markdown note per article. Obsidian/Logseq-compatible.
+VAULT_DIR = Path(
+    os.environ.get("PODCAST_VAULT_DIR", str(DATA_DIR / "vault"))
+).expanduser()
+
+# ---------------------------------------------------------------------------
+# HTTP server (still used for the local landing page / submit form).
+# ---------------------------------------------------------------------------
 HTTP_HOST = os.environ.get("PODCAST_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("PODCAST_HTTP_PORT", "8765"))
 
-# The base URL the iPhone will hit. With Tailscale, use your Tailnet hostname,
-# e.g. http://my-mac.tail-xxxx.ts.net:8765
-# Falls back to your local hostname so subscribing on the home LAN works too.
+# Public base URL for `<enclosure>` and feed links. When B2 is configured,
+# this should be the B2 public URL pattern, e.g.
+#   https://f005.backblazeb2.com/file/my-podcast
+# Otherwise falls back to the local mDNS hostname.
 PUBLIC_BASE_URL = os.environ.get("PODCAST_PUBLIC_URL") or f"http://{socket.gethostname()}:{HTTP_PORT}"
 
-# Feed metadata
+# ---------------------------------------------------------------------------
+# Feed metadata.
+# ---------------------------------------------------------------------------
 FEED_TITLE = os.environ.get("PODCAST_FEED_TITLE", "My Article Podcast")
 FEED_DESCRIPTION = os.environ.get(
     "PODCAST_FEED_DESCRIPTION",
@@ -43,7 +54,31 @@ FEED_DESCRIPTION = os.environ.get(
 )
 FEED_AUTHOR = os.environ.get("PODCAST_FEED_AUTHOR", "Me")
 
+# ---------------------------------------------------------------------------
+# Backblaze B2 (optional). When all three are set, the daemon uploads each
+# completed MP3 + feed.xml to the bucket and the feed URLs point at B2 (which
+# gives you HTTPS + reachability from anywhere — so Apple Podcasts works).
+# ---------------------------------------------------------------------------
+B2_KEY_ID = os.environ.get("PODCAST_B2_KEY_ID", "").strip()
+B2_APP_KEY = os.environ.get("PODCAST_B2_APP_KEY", "").strip()
+B2_BUCKET = os.environ.get("PODCAST_B2_BUCKET", "").strip()
+
+# Path prefix inside the bucket. Lets you share one bucket across projects.
+B2_PREFIX = os.environ.get("PODCAST_B2_PREFIX", "").strip().strip("/")
+
+
+def b2_enabled() -> bool:
+    return bool(B2_KEY_ID and B2_APP_KEY and B2_BUCKET)
+
+
+# ---------------------------------------------------------------------------
+# Script generation knobs.
+# ---------------------------------------------------------------------------
+SCRIPT_MODEL = os.environ.get("PODCAST_SCRIPT_MODEL", "claude-opus-4-7")
+GROUPING_MODEL = os.environ.get("PODCAST_GROUPING_MODEL", "claude-haiku-4-5-20251001")
+
 
 def ensure_dirs() -> None:
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
