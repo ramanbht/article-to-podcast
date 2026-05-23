@@ -26,8 +26,8 @@ import combine
 import config
 import upload
 import vault
-from extract import fetch_article
-from generate_script import generate_script
+from extract import UnscriptableError, fetch_article
+from generate_script import ClaudeDeclinedError, generate_script
 from memory import build_context, suggest_related_slugs
 from server import build_feed, run_server
 from synthesize import synthesize
@@ -197,6 +197,11 @@ def _fetch_with_status(article: dict) -> dict | None:
     )
     try:
         title, body = fetch_article(article["url"])
+    except UnscriptableError as e:
+        log_error(f"⊘ {article['id']} skipped: {e}")
+        write_meta(meta_path, status="skipped", error=str(e), skippedAt=now_iso())
+        article["_path"].unlink(missing_ok=True)
+        return None
     except Exception as e:
         log_error(f"✗ fetch failed for {article['id']} ({article['url']}): {e}")
         write_meta(meta_path, status="error", error=f"fetch: {e}", errorAt=now_iso())
@@ -287,6 +292,11 @@ def process_group(group: list[dict], memory_context: str, vault_notes: list[vaul
         upload_episode_and_feed(mp3_path)
 
         log(f"✓ {ep_id} done ({duration:.1f}s audio)")
+    except (UnscriptableError, ClaudeDeclinedError) as e:
+        # Expected failure mode (junk article body, paywall, X stub, etc.).
+        # Log a single clean line; no traceback noise.
+        log_error(f"⊘ {ep_id} skipped: {e}")
+        write_meta(meta_path, status="skipped", error=str(e), skippedAt=now_iso())
     except Exception as e:
         tb = traceback.format_exc()
         log_error(f"✗ {ep_id}: {e}\n{tb}")

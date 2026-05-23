@@ -112,10 +112,20 @@ _SCRIPT_RE = re.compile(r"<script>\s*(.*?)\s*</script>", flags=re.DOTALL | re.IG
 _METADATA_RE = re.compile(r"<metadata>\s*(.*?)\s*</metadata>", flags=re.DOTALL | re.IGNORECASE)
 
 
+class ClaudeDeclinedError(RuntimeError):
+    """Claude returned a response with no <script> block. Usually means the
+    article body was junk (error page, paywall stub, etc.) and Claude refused
+    to fabricate content. Daemon handles cleanly."""
+
+
 def _parse_response(raw: str) -> ScriptResult:
     s_match = _SCRIPT_RE.search(raw)
     if not s_match:
-        raise RuntimeError(f"no <script> block in claude response (first 400 chars): {raw[:400]!r}")
+        # Surface the first line of Claude's explanation as the error message.
+        refusal = " ".join(raw.strip().split())[:300]
+        raise ClaudeDeclinedError(
+            f"Claude declined to script (likely the fetched body wasn't real article content): {refusal}"
+        )
     script = s_match.group(1).strip()
     if len(script) < 100:
         raise RuntimeError(f"script suspiciously short: {script!r}")
