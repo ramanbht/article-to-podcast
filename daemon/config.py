@@ -54,6 +54,16 @@ FEED_DESCRIPTION = os.environ.get(
 )
 FEED_AUTHOR = os.environ.get("PODCAST_FEED_AUTHOR", "Me")
 
+# The channel <link> in RSS — the "website for this show". Defaults to the
+# feed URL itself if not set (always reachable). Override to your GitHub repo
+# / personal site / anything that returns 200.
+FEED_WEBSITE = os.environ.get("PODCAST_FEED_WEBSITE", "").strip()
+
+# Bucket key for the cover image. Apple Podcasts caches artwork by URL very
+# aggressively — change this filename whenever you publish a new cover so Apple
+# refetches instead of showing the old one for days.
+COVER_KEY = os.environ.get("PODCAST_COVER_KEY", "cover.jpg").strip()
+
 # ---------------------------------------------------------------------------
 # Backblaze B2 (optional). When all three are set, the daemon uploads each
 # completed MP3 + feed.xml to the bucket and the feed URLs point at B2 (which

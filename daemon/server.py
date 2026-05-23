@@ -64,12 +64,52 @@ def _iso_to_rfc2822(iso: str | None) -> str:
         return format_datetime(datetime.now(timezone.utc))
 
 
+def _channel_image_url() -> str:
+    """Apple Podcasts requires <itunes:image>. Defaults to <bucket>/<COVER_KEY>
+    when B2 is configured; otherwise the local /<COVER_KEY> path."""
+    if config.b2_enabled():
+        try:
+            return upload.public_url_for(config.COVER_KEY)
+        except Exception:
+            pass
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/{config.COVER_KEY}"
+
+
+def _feed_self_url() -> str:
+    if config.b2_enabled():
+        try:
+            return upload.public_url_for("feed.xml")
+        except Exception:
+            pass
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/feed.xml"
+
+
+def _vault_summary_for(episode_id: str | None) -> str:
+    """Look up the vault note for this episode id (if any) and return its
+    Summary section. Empty string when no vault entry exists yet."""
+    if not episode_id:
+        return ""
+    try:
+        import vault as _vault
+        for note in _vault.load_all_notes():
+            if note.frontmatter.get("episode_id") == episode_id:
+                return note.summary
+    except Exception:
+        pass
+    return ""
+
+
 def build_feed() -> bytes:
     base = config.PUBLIC_BASE_URL.rstrip("/")
     chan_title = html.escape(config.FEED_TITLE)
     chan_desc = html.escape(config.FEED_DESCRIPTION)
     chan_author = html.escape(config.FEED_AUTHOR)
-    chan_link = base + "/"
+    # Channel <link> is the "show's website". Default to the feed URL itself
+    # so validators can always reach a 200. Override with PODCAST_FEED_WEBSITE.
+    chan_link = config.FEED_WEBSITE or _feed_self_url()
+    chan_image = html.escape(_channel_image_url())
+    feed_self = html.escape(_feed_self_url())
+    last_build = format_datetime(datetime.now(timezone.utc))
 
     items_xml: list[str] = []
     for m in _load_meta():
@@ -82,7 +122,14 @@ def build_feed() -> bytes:
 
         title = html.escape((m.get("title") or m.get("url") or "Episode").strip())
         url = html.escape(m.get("url") or "")
-        description = html.escape(f"{m.get('url') or ''}")
+        # Description: prefer the vault summary if we have one, else a sentence
+        # built from the article URL. Apple rejects empty/URL-only descriptions.
+        summary = _vault_summary_for(m.get("id"))
+        if summary:
+            description_text = f"{summary}\n\nSource: {m.get('url') or ''}"
+        else:
+            description_text = f"Narration of: {m.get('url') or 'an article'}"
+        description = html.escape(description_text)
         guid = html.escape(str(m["id"]))
         pub = _iso_to_rfc2822(m.get("doneAt") or m.get("createdAt"))
         duration = int(round(float(m.get("durationSec") or 0)))
@@ -98,19 +145,29 @@ def build_feed() -> bytes:
       <enclosure url="{html.escape(enclosure_url)}" length="{length}" type="audio/mpeg" />
       <itunes:duration>{duration}</itunes:duration>
       <itunes:explicit>false</itunes:explicit>
+      <itunes:image href="{chan_image}" />
     </item>""")
 
     feed = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
     <title>{chan_title}</title>
     <link>{chan_link}</link>
+    <atom:link href="{feed_self}" rel="self" type="application/rss+xml" />
     <description>{chan_desc}</description>
     <language>en-us</language>
+    <pubDate>{last_build}</pubDate>
+    <lastBuildDate>{last_build}</lastBuildDate>
     <itunes:author>{chan_author}</itunes:author>
     <itunes:summary>{chan_desc}</itunes:summary>
     <itunes:explicit>false</itunes:explicit>
-    <itunes:category text="News"/>
+    <itunes:type>episodic</itunes:type>
+    <itunes:image href="{chan_image}" />
+    <itunes:category text="News" />
+    <itunes:owner>
+      <itunes:name>{chan_author}</itunes:name>
+      <itunes:email>noreply@example.com</itunes:email>
+    </itunes:owner>
 {chr(10).join(items_xml)}
   </channel>
 </rss>
