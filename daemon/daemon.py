@@ -83,17 +83,25 @@ def materialize_placeholder(placeholder: Path) -> Path | None:
     return None
 
 
+REQUEST_SUFFIXES = (".json", ".txt")  # iOS Shortcuts defaults to .txt when
+                                     # writing Text content — accept both.
+
+
+def _is_request_name(name: str) -> bool:
+    return name.startswith("request-") and name.endswith(REQUEST_SUFFIXES)
+
+
 def find_request_files(inbox: Path) -> list[Path]:
     materialized: list[Path] = []
     for p in inbox.iterdir():
         if is_icloud_placeholder(p):
             real_name = p.name[1:].removesuffix(".icloud")
-            if real_name.startswith("request-") and real_name.endswith(".json"):
+            if _is_request_name(real_name):
                 got = materialize_placeholder(p)
                 if got is not None:
                     materialized.append(got)
             continue
-        if p.name.startswith("request-") and p.name.endswith(".json"):
+        if _is_request_name(p.name):
             materialized.append(p)
     return sorted(materialized)
 
