@@ -165,16 +165,63 @@ def upload_episode_and_feed(mp3_path: Path) -> None:
 # Request → episode
 # ---------------------------------------------------------------------------
 
+# Per-file noisy-error suppression so iCloud lock contention doesn't spam
+# the log every poll cycle. Keyed by path → last error message we logged.
+_request_read_errors: dict[Path, str] = {}
+
+
+def _read_request_text(req_path: Path) -> str:
+    """Read a request file, retrying transient iCloud lock errors (EDEADLK,
+    EAGAIN) with short backoff. Raises OSError if all retries fail; the
+    caller logs once-per-error-state and leaves the file for the next poll."""
+    last: Exception | None = None
+    for delay in (0, 0.2, 0.8, 2.0):
+        if delay:
+            time.sleep(delay)
+        try:
+            return req_path.read_text()
+        except OSError as e:
+            last = e
+            # 11 = EDEADLK / EAGAIN on iCloud-managed files
+            if e.errno not in (11, 16, 35):
+                raise
+    assert last is not None
+    raise last
+
+
 def _parse_request(req_path: Path) -> dict | None:
     try:
-        payload = json.loads(req_path.read_text())
-    except Exception as e:
-        log_error(f"bad JSON in {req_path.name}: {e}")
+        text = _read_request_text(req_path)
+    except OSError as e:
+        # Transient I/O — don't delete the file, just try again next poll.
+        # Log only when the error changes (avoid 6000-line log spam).
+        msg = f"{type(e).__name__} errno={e.errno}: {e}"
+        if _request_read_errors.get(req_path) != msg:
+            _request_read_errors[req_path] = msg
+            log_error(f"⏳ {req_path.name}: i/o not ready ({msg}) — will retry")
         return None
+
+    # Successful read — clear any stale failure state.
+    _request_read_errors.pop(req_path, None)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as e:
+        log_error(f"✗ {req_path.name}: malformed JSON: {e}")
+        try:
+            req_path.unlink()
+        except Exception:
+            pass
+        return None
+
     url = (payload.get("url") or "").strip()
     rid = (payload.get("id") or req_path.stem.removeprefix("request-")).strip()
     if not url or not rid:
-        log_error(f"missing url or id in {req_path.name}: {payload!r}")
+        log_error(f"✗ {req_path.name}: missing url or id: {payload!r}")
+        try:
+            req_path.unlink()
+        except Exception:
+            pass
         return None
     return {
         "id": rid,

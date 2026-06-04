@@ -18,6 +18,22 @@ import trafilatura
 USER_AGENT = "podcast-daemon/0.2 (https://github.com/ramanbht/article-to-podcast)"
 MIN_BODY_CHARS = 200
 
+# arXiv PDF URLs are useless to trafilatura (PDF binary). The /abs/<id> page
+# is HTML containing title + authors + abstract — much better for narration.
+_ARXIV_PDF_RE = re.compile(
+    r"^(https?://(?:www\.)?arxiv\.org)/pdf/([^/?#]+?)(?:\.pdf)?(?:[?#].*)?$",
+    re.I,
+)
+
+
+def _normalize_url(url: str) -> str:
+    """Rewrite URLs that point at known-unscriptable resources (arXiv PDFs,
+    etc.) to a sibling URL that trafilatura can actually extract from."""
+    m = _ARXIV_PDF_RE.match(url)
+    if m:
+        return f"{m.group(1)}/abs/{m.group(2)}"
+    return url
+
 # Bodies/titles that match these patterns almost certainly came from a JS-
 # required stub, paywall, or login wall — don't bother asking Claude.
 _ERROR_PAGE_PATTERNS = [
@@ -178,6 +194,7 @@ def _fetch_generic(url: str) -> tuple[str, str]:
 def fetch_article(url: str) -> tuple[str, str]:
     """Return (title, body_text). Raises UnscriptableError for known-unscriptable
     sources (so the daemon can log cleanly without invoking Claude)."""
+    url = _normalize_url(url)
     if _is_reddit(url):
         return _fetch_reddit(url)
     return _fetch_generic(url)
