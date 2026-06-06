@@ -14,6 +14,7 @@ Per-iteration flow:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -58,10 +59,54 @@ def log_error(msg: str) -> None:
 
 # ---------------------------------------------------------------------------
 # iCloud placeholder handling
+#
+# iCloud evicts file *contents* to the cloud in two visible forms:
+#   1. `.{name}.icloud` sidecar placeholders (classic, when file not yet
+#      downloaded at all).
+#   2. "dataless" files that keep their real name but have the SF_DATALESS
+#      flag set (macOS "Optimize Mac Storage" evicted the body). Reading one
+#      directly can raise OSError EDEADLK because the OS won't auto-download
+#      mid-read. These look like normal files, so we must check the flag.
+# Both are resolved by `brctl download <path>`.
 # ---------------------------------------------------------------------------
+
+SF_DATALESS = 0x40000000  # macOS <sys/stat.h>
+
 
 def is_icloud_placeholder(path: Path) -> bool:
     return path.name.startswith(".") and path.name.endswith(".icloud")
+
+
+def is_dataless(path: Path) -> bool:
+    """True if the file is an iCloud dataless placeholder (contents evicted)."""
+    try:
+        return bool(os.stat(path).st_flags & SF_DATALESS)
+    except (AttributeError, OSError):
+        return False
+
+
+def _brctl_download(path: Path) -> None:
+    try:
+        subprocess.run(
+            ["/usr/bin/brctl", "download", str(path)],
+            check=False, timeout=60, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def ensure_downloaded(path: Path, timeout_s: float = 30.0) -> bool:
+    """If `path` is a dataless placeholder, trigger its download and wait for
+    the contents to materialize. Returns True if the file is (now) materialized."""
+    if not is_dataless(path):
+        return True
+    _brctl_download(path)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not is_dataless(path):
+            return True
+        time.sleep(0.5)
+    return not is_dataless(path)
 
 
 def materialize_placeholder(placeholder: Path) -> Path | None:
@@ -69,13 +114,7 @@ def materialize_placeholder(placeholder: Path) -> Path | None:
     real_path = placeholder.parent / real_name
     if real_path.exists():
         return real_path
-    try:
-        subprocess.run(
-            ["/usr/bin/brctl", "download", str(placeholder)],
-            check=False, timeout=60, capture_output=True,
-        )
-    except Exception:
-        pass
+    _brctl_download(placeholder)
     for _ in range(60):
         if real_path.exists():
             return real_path
@@ -171,9 +210,11 @@ _request_read_errors: dict[Path, str] = {}
 
 
 def _read_request_text(req_path: Path) -> str:
-    """Read a request file, retrying transient iCloud lock errors (EDEADLK,
-    EAGAIN) with short backoff. Raises OSError if all retries fail; the
-    caller logs once-per-error-state and leaves the file for the next poll."""
+    """Read a request file, first materializing it if iCloud evicted its
+    contents (dataless placeholder), then retrying transient lock errors
+    (EDEADLK/EAGAIN) with short backoff. Raises OSError if all retries fail;
+    the caller logs once-per-error-state and leaves the file for next poll."""
+    ensure_downloaded(req_path)
     last: Exception | None = None
     for delay in (0, 0.2, 0.8, 2.0):
         if delay:
@@ -185,6 +226,8 @@ def _read_request_text(req_path: Path) -> str:
             # 11 = EDEADLK / EAGAIN on iCloud-managed files
             if e.errno not in (11, 16, 35):
                 raise
+            # A dataless file can throw EDEADLK on read — (re)trigger download.
+            ensure_downloaded(req_path)
     assert last is not None
     raise last
 
@@ -394,9 +437,26 @@ def watch_loop() -> None:
         time.sleep(POLL_SECONDS)
 
 
+def _dedupe_by_url(parsed: list[dict]) -> list[dict]:
+    """Drop duplicate URLs within a batch (e.g. an accidental double-submit).
+    Keeps the first occurrence; removes the request files of the dropped ones."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for a in parsed:
+        key = a["url"].strip().rstrip("/")
+        if key in seen:
+            log(f"   dedupe: dropping duplicate submission of {a['url']} [{a['id']}]")
+            a["_path"].unlink(missing_ok=True)
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
 def _run_batch(request_paths: list[Path]) -> None:
-    # Parse + fetch all requests in this batch.
+    # Parse + dedupe + fetch all requests in this batch.
     parsed = [p for p in (_parse_request(rp) for rp in request_paths) if p is not None]
+    parsed = _dedupe_by_url(parsed)
     fetched = [a for a in (_fetch_with_status(a) for a in parsed) if a is not None]
     if not fetched:
         return
