@@ -151,6 +151,117 @@ def _fetch_reddit(url: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Twitter / X special-case (via fxtwitter — free, no auth)
+# ---------------------------------------------------------------------------
+# x.com serves a JS-required stub to scrapers. fxtwitter.com mirrors tweet
+# content as clean JSON (the service Discord/Telegram use to unfurl tweets).
+
+_TWITTER_HOST = re.compile(r"^(?:www\.|mobile\.)?(?:twitter|x)\.com$", re.I)
+_TWEET_ID_RE = re.compile(r"/status(?:es)?/(\d+)")
+
+# Overridable in case fxtwitter goes down (vxtwitter.com is a drop-in alt with
+# a different JSON shape, so prefer another fx-compatible host).
+FXTWITTER_API = "https://api.fxtwitter.com"
+
+
+def _is_twitter(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+        return bool(_TWITTER_HOST.match(host))
+    except Exception:
+        return False
+
+
+def _draftjs_to_text(content: dict) -> str:
+    """Flatten fxtwitter's X-Article Draft.js content into plain text."""
+    blocks = (content or {}).get("blocks") or []
+    lines = [b.get("text", "").strip() for b in blocks]
+    return "\n\n".join(l for l in lines if l)
+
+
+def _first_outbound_url(tweet: dict) -> str | None:
+    """Find a non-Twitter URL the tweet links to (t.co resolved), if any."""
+    facets = ((tweet.get("raw_text") or {}).get("facets")) or []
+    for f in facets:
+        real = f.get("original") or f.get("replacement") or ""
+        if real.startswith("http") and not _is_twitter(real) and "t.co/" not in real:
+            return real
+    # Fallback: resolve any t.co in the raw text via redirect.
+    raw = (tweet.get("raw_text") or {}).get("text") or ""
+    for token in raw.split():
+        if token.startswith("https://t.co/"):
+            resolved = _resolve_redirects(token)
+            if resolved and not _is_twitter(resolved):
+                return resolved
+    return None
+
+
+def _fetch_twitter(url: str) -> tuple[str, str]:
+    m = _TWEET_ID_RE.search(url)
+    if not m:
+        raise UnscriptableError(f"couldn't find a tweet id in {url}")
+    tweet_id = m.group(1)
+
+    try:
+        raw = _http_get(f"{FXTWITTER_API}/status/{tweet_id}")
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"fxtwitter fetch failed for {url}: {e}") from e
+
+    if data.get("code") != 200 or "tweet" not in data:
+        raise UnscriptableError(f"fxtwitter returned no tweet for {url}: {data.get('message')}")
+
+    tweet = data["tweet"]
+    author = tweet.get("author") or {}
+    author_name = author.get("name") or author.get("screen_name") or "Someone"
+
+    parts: list[str] = []
+    title = f"{author_name} on X"
+
+    # 1. X Article (long-form) — richest case, has a full body.
+    article = tweet.get("article")
+    if article and article.get("content"):
+        art_title = (article.get("title") or "").strip()
+        if art_title:
+            title = art_title
+        body_text = _draftjs_to_text(article["content"])
+        if body_text:
+            parts.append(body_text)
+
+    # 2. Tweet text (note tweets carry their full long text here).
+    text = (tweet.get("text") or "").strip()
+    if text:
+        parts.append(text)
+
+    # 3. Quoted tweet.
+    quote = tweet.get("quote")
+    if quote:
+        q_author = (quote.get("author") or {}).get("name") or "someone"
+        q_text = (quote.get("text") or "").strip()
+        if q_text:
+            parts.append(f"Quoting {q_author}: {q_text}")
+
+    body = "\n\n".join(parts).strip()
+
+    # 4. If it's thin and mainly points to an external article, narrate that.
+    if len(body) < MIN_BODY_CHARS:
+        outbound = _first_outbound_url(tweet)
+        if outbound:
+            try:
+                return _fetch_generic(outbound)
+            except Exception:
+                pass  # fall through to the too-short error below
+
+    if len(body) < MIN_BODY_CHARS:
+        raise UnscriptableError(
+            f"tweet {tweet_id} is too short to narrate ({len(body)} chars) and "
+            f"doesn't link to a longer article"
+        )
+
+    return title, body
+
+
+# ---------------------------------------------------------------------------
 # Generic (trafilatura) path
 # ---------------------------------------------------------------------------
 
@@ -195,6 +306,8 @@ def fetch_article(url: str) -> tuple[str, str]:
     """Return (title, body_text). Raises UnscriptableError for known-unscriptable
     sources (so the daemon can log cleanly without invoking Claude)."""
     url = _normalize_url(url)
+    if _is_twitter(url):
+        return _fetch_twitter(url)
     if _is_reddit(url):
         return _fetch_reddit(url)
     return _fetch_generic(url)
