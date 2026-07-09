@@ -28,7 +28,7 @@ import config
 import upload
 import vault
 from extract import UnscriptableError, fetch_article
-from generate_script import ClaudeDeclinedError, generate_script
+from generate_script import ClaudeDeclinedError, RetriableError, generate_script
 from memory import build_context, suggest_related_slugs
 from server import build_feed, run_server
 from synthesize import synthesize
@@ -124,6 +124,37 @@ def materialize_placeholder(placeholder: Path) -> Path | None:
 
 REQUEST_SUFFIXES = (".json", ".txt")  # iOS Shortcuts defaults to .txt when
                                      # writing Text content — accept both.
+
+# Retriable-failure backoff: when script-gen fails transiently (expired login,
+# rate limit), keep the request file but don't hammer it every poll. Retry at
+# most once per DEFER_COOLDOWN_SEC.
+DEFER_COOLDOWN_SEC = 300
+_deferred_until: dict[Path, float] = {}
+_deferred_reason: dict[Path, str] = {}
+
+
+def _defer_group(group: list[dict], reason: str) -> None:
+    due = time.time() + DEFER_COOLDOWN_SEC
+    for a in group:
+        p = a["_path"]
+        _deferred_until[p] = due
+        # Log once per new reason so a persistent auth outage doesn't spam.
+        if _deferred_reason.get(p) != reason:
+            _deferred_reason[p] = reason
+            log_error(
+                f"↺ {p.name} deferred (will retry after ~{DEFER_COOLDOWN_SEC//60}m): {reason}"
+            )
+
+
+def _is_deferred(path: Path) -> bool:
+    due = _deferred_until.get(path)
+    if due is None:
+        return False
+    if time.time() >= due:
+        # Cooldown elapsed — clear and allow a retry.
+        _deferred_until.pop(path, None)
+        return False
+    return True
 
 
 def _is_request_name(name: str) -> bool:
@@ -382,19 +413,25 @@ def process_group(group: list[dict], memory_context: str, vault_notes: list[vaul
         upload_episode_and_feed(mp3_path)
 
         log(f"✓ {ep_id} done ({duration:.1f}s audio)")
+    except RetriableError as e:
+        # Transient, fixable failure (expired `claude` login, rate limit,
+        # network blip). Do NOT consume the request — leave it in the inbox
+        # and back off so we retry automatically once the problem clears.
+        _defer_group(group, str(e))
+        write_meta(meta_path, status="deferred", error=str(e), deferredAt=now_iso())
+        return  # skip the unlink in finally
     except (UnscriptableError, ClaudeDeclinedError) as e:
-        # Expected failure mode (junk article body, paywall, X stub, etc.).
-        # Log a single clean line; no traceback noise.
+        # Expected permanent failure (junk body, paywall, X stub, etc.).
         log_error(f"⊘ {ep_id} skipped: {e}")
         write_meta(meta_path, status="skipped", error=str(e), skippedAt=now_iso())
     except Exception as e:
         tb = traceback.format_exc()
         log_error(f"✗ {ep_id}: {e}\n{tb}")
         write_meta(meta_path, status="error", error=str(e), errorAt=now_iso())
-    finally:
-        # Always clean up request files for the group, even on failure.
-        for a in group:
-            a["_path"].unlink(missing_ok=True)
+    # Consume request files for the group on success or permanent failure.
+    # (RetriableError returns early above, keeping the files for a later retry.)
+    for a in group:
+        a["_path"].unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +456,8 @@ def watch_loop() -> None:
             # STABLE_CHECKS consecutive polls (iCloud sync still in flight).
             stable: list[Path] = []
             for req in requests:
+                if _is_deferred(req):
+                    continue  # in retry backoff after a transient failure
                 try:
                     sz = req.stat().st_size
                 except FileNotFoundError:

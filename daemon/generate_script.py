@@ -118,6 +118,32 @@ class ClaudeDeclinedError(RuntimeError):
     to fabricate content. Daemon handles cleanly."""
 
 
+class RetriableError(RuntimeError):
+    """A transient, fixable failure (expired `claude` login, network blip).
+    The daemon should NOT consume the request — keep it and retry later."""
+
+
+# Substrings in the claude CLI's stderr/stdout that mean "not your article's
+# fault, try again after fixing auth / connectivity".
+_RETRIABLE_MARKERS = (
+    "invalid authentication credentials",
+    "please run /login",
+    "not logged in",
+    "401",
+    "rate limit",
+    "429",
+    "overloaded",
+    "529",
+    "connection error",
+    "timeout",
+)
+
+
+def _is_retriable(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _RETRIABLE_MARKERS)
+
+
 def _parse_response(raw: str) -> ScriptResult:
     s_match = _SCRIPT_RE.search(raw)
     if not s_match:
@@ -162,7 +188,8 @@ def generate_script(articles: list[dict], memory_context: str = "") -> ScriptRes
         capture_output=True, text=True, timeout=TIMEOUT_SEC,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI failed (exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}"
-        )
+        detail = result.stderr.strip() or result.stdout.strip()
+        if _is_retriable(detail):
+            raise RetriableError(f"claude CLI transient failure: {detail}")
+        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {detail}")
     return _parse_response(result.stdout.strip())
