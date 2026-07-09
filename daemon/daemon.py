@@ -25,6 +25,7 @@ from pathlib import Path
 
 import combine
 import config
+import notify
 import upload
 import vault
 from extract import UnscriptableError, fetch_article
@@ -132,6 +133,45 @@ DEFER_COOLDOWN_SEC = 300
 _deferred_until: dict[Path, float] = {}
 _deferred_reason: dict[Path, str] = {}
 
+# Auth-down notification state: notify once when auth goes down, once when it
+# recovers — never per-retry.
+_AUTH_MARKERS = ("authenticat", "401", "please run /login", "not logged in")
+_auth_down_notified = False
+
+
+def _looks_like_auth(reason: str) -> bool:
+    low = (reason or "").lower()
+    return any(m in low for m in _AUTH_MARKERS)
+
+
+def _note_auth_down(reason: str) -> None:
+    """Post a one-time notification that the claude login has expired."""
+    global _auth_down_notified
+    if _auth_down_notified or not _looks_like_auth(reason):
+        return
+    _auth_down_notified = True
+    log_error("🔔 notifying: claude login appears to be down")
+    notify.macos_notification(
+        title="RamanCast paused",
+        subtitle="Claude login expired",
+        message="New episodes are queued. Run  claude /login  in Terminal to resume.",
+    )
+
+
+def _note_auth_recovered() -> None:
+    """If we'd flagged auth as down, announce recovery once."""
+    global _auth_down_notified
+    if not _auth_down_notified:
+        return
+    _auth_down_notified = False
+    log("🔔 notifying: claude login recovered")
+    notify.macos_notification(
+        title="RamanCast resumed",
+        subtitle="Claude login working again",
+        message="Queued articles are being turned into episodes.",
+        sound="Glass",
+    )
+
 
 def _defer_group(group: list[dict], reason: str) -> None:
     due = time.time() + DEFER_COOLDOWN_SEC
@@ -144,6 +184,7 @@ def _defer_group(group: list[dict], reason: str) -> None:
             log_error(
                 f"↺ {p.name} deferred (will retry after ~{DEFER_COOLDOWN_SEC//60}m): {reason}"
             )
+    _note_auth_down(reason)
 
 
 def _is_deferred(path: Path) -> bool:
@@ -411,6 +452,10 @@ def process_group(group: list[dict], memory_context: str, vault_notes: list[vaul
 
         # Upload to B2 (no-op if not configured).
         upload_episode_and_feed(mp3_path)
+
+        # A successful script means auth is healthy again — notify if we'd
+        # previously flagged it as down.
+        _note_auth_recovered()
 
         log(f"✓ {ep_id} done ({duration:.1f}s audio)")
     except RetriableError as e:
